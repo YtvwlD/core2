@@ -12,6 +12,8 @@ pub use cursor::Cursor;
 pub use error::{Error, ErrorKind, Result};
 #[cfg(not(feature = "std"))]
 pub use traits::{BufRead, Bytes, Chain, Read, Seek, SeekFrom, Take, Write};
+#[cfg(feature = "alloc")]
+pub use traits::{read_to_end, default_read_to_string};
 
 #[cfg(feature = "std")]
 pub use std::io::{

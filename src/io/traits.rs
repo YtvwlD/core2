@@ -2,7 +2,7 @@ use super::error::{Error, ErrorKind, Result};
 use core::{cmp, fmt, slice};
 
 #[cfg(feature = "alloc")]
-pub use alloc::vec::Vec;
+pub use alloc::{string::String, vec::Vec};
 
 #[cfg(feature = "alloc")]
 struct Guard<'a> {
@@ -19,6 +19,130 @@ impl Drop for Guard<'_> {
     }
 }
 
+
+// Several `read_to_string` and `read_line` methods in the standard library will
+// append data into a `String` buffer, but we need to be pretty careful when
+// doing this. The implementation will just call `.as_mut_vec()` and then
+// delegate to a byte-oriented reading method, but we must ensure that when
+// returning we never leave `buf` in a state such that it contains invalid UTF-8
+// in its bounds.
+//
+// To this end, we use an RAII guard (to protect against panics) which updates
+// the length of the string when it is dropped. This guard initially truncates
+// the string to the prior length and only after we've validated that the
+// new contents are valid UTF-8 do we allow it to set a longer length.
+//
+// The unsafety in this function is twofold:
+//
+// 1. We're looking at the raw bytes of `buf`, so we take on the burden of UTF-8
+//    checks.
+// 2. We're passing a raw buffer to the function `f`, and it is expected that
+//    the function only *appends* bytes to the buffer. We'll get undefined
+//    behavior if existing bytes are overwritten to have non-UTF-8 data.
+#[cfg(feature = "alloc")]
+pub(crate) unsafe fn append_to_string<F>(buf: &mut String, f: F) -> Result<usize>
+where
+    F: FnOnce(&mut Vec<u8>) -> Result<usize>,
+{
+    let mut g = Guard { len: buf.len(), buf: buf.as_mut_vec() };
+    let ret = f(g.buf);
+    if core::str::from_utf8(&g.buf[g.len..]).is_err() {
+        ret.and_then(|_| {
+            Err(crate::io::Error::new(
+                ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8"
+            ))
+        })
+    } else {
+        g.len = g.buf.len();
+        ret
+    }
+}
+
+/*
+// This uses an adaptive system to extend the vector when it fills. We want to
+// avoid paying to allocate and zero a huge chunk of memory if the reader only
+// has 4 bytes while still making large reads if the reader does have a ton
+// of data to return. Simply tacking on an extra DEFAULT_BUF_SIZE space every
+// time is 4,500 times (!) slower than a default reservation size of 32 if the
+// reader has a very small amount of data to return.
+#[cfg(feature = "alloc")]
+pub fn default_read_to_end<R: Read + ?Sized>(r: &mut R, buf: &mut Vec<u8>) -> Result<usize> {
+    let start_len = buf.len();
+    let start_cap = buf.capacity();
+
+    let mut initialized = 0; // Extra initialized bytes from previous loop iteration
+    loop {
+        if buf.len() == buf.capacity() {
+            buf.reserve(32); // buf is full, need more space
+        }
+
+        let mut read_buf = ReadBuf::uninit(buf.spare_capacity_mut());
+
+        // SAFETY: These bytes were initialized but not filled in the previous loop
+        unsafe {
+            read_buf.assume_init(initialized);
+        }
+
+        match r.read_buf(&mut read_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+
+        if read_buf.filled_len() == 0 {
+            return Ok(buf.len() - start_len);
+        }
+
+        // store how much was initialized but not filled
+        initialized = read_buf.initialized_len() - read_buf.filled_len();
+        let new_len = read_buf.filled_len() + buf.len();
+
+        // SAFETY: ReadBuf's invariants mean this much memory is init
+        unsafe {
+            buf.set_len(new_len);
+        }
+
+        if buf.len() == buf.capacity() && buf.capacity() == start_cap {
+            // The buffer might be an exact fit. Let's read into a probe buffer
+            // and see if it returns `Ok(0)`. If so, we've avoided an
+            // unnecessary doubling of the capacity. But if not, append the
+            // probe buffer to the primary buffer and let its capacity grow.
+            let mut probe = [0u8; 32];
+
+            loop {
+                match r.read(&mut probe) {
+                    Ok(0) => return Ok(buf.len() - start_len),
+                    Ok(n) => {
+                        buf.extend_from_slice(&probe[..n]);
+                        break;
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+}
+*/
+
+#[cfg(feature = "alloc")]
+pub fn default_read_to_string<R: Read + ?Sized>(
+    r: &mut R,
+    buf: &mut String,
+) -> Result<usize> {
+    // Note that we do *not* call `r.read_to_end()` here. We are passing
+    // `&mut Vec<u8>` (the raw contents of `buf`) into the `read_to_end`
+    // method to fill it up. An arbitrary implementation could overwrite the
+    // entire contents of the vector, not just append to it (which is what
+    // we are expecting).
+    //
+    // To prevent extraneously checking the UTF-8-ness of the entire buffer
+    // we pass it to our hardcoded `default_read_to_end` implementation which
+    // we know is guaranteed to only read data into the end of the buffer.
+    unsafe { append_to_string(buf, |b| read_to_end(r, b)) }
+}
+
 // This uses an adaptive system to extend the vector when it fills. We want to
 // avoid paying to allocate and zero a huge chunk of memory if the reader only
 // has 4 bytes while still making large reads if the reader does have a ton
@@ -29,7 +153,7 @@ impl Drop for Guard<'_> {
 // Because we're extending the buffer with uninitialized data for trusted
 // readers, we need to make sure to truncate that if any of this panics.
 #[cfg(feature = "alloc")]
-fn read_to_end<R: Read + ?Sized>(r: &mut R, buf: &mut Vec<u8>) -> Result<usize> {
+pub fn read_to_end<R: Read + ?Sized>(r: &mut R, buf: &mut Vec<u8>) -> Result<usize> {
     read_to_end_with_reservation(r, buf, |_| 32)
 }
 
@@ -272,6 +396,49 @@ pub trait Read {
     #[cfg(feature = "alloc")]
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
         read_to_end(self, buf)
+    }
+    
+    /// Read all bytes until EOF in this source, appending them to `buf`.
+    ///
+    /// If successful, this function returns the number of bytes which were read
+    /// and appended to `buf`.
+    ///
+    /// # Errors
+    ///
+    /// If the data in this stream is *not* valid UTF-8 then an error is
+    /// returned and `buf` is unchanged.
+    ///
+    /// See [`read_to_end`] for other error semantics.
+    ///
+    /// [`read_to_end`]: Read::read_to_end
+    ///
+    /// # Examples
+    ///
+    /// [`File`]s implement `Read`:
+    ///
+    /// [`File`]: crate::fs::File
+    ///
+    /// ```no_run
+    /// use std::io;
+    /// use std::io::prelude::*;
+    /// use std::fs::File;
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let mut f = File::open("foo.txt")?;
+    ///     let mut buffer = String::new();
+    ///
+    ///     f.read_to_string(&mut buffer)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// (See also the [`std::fs::read_to_string`] convenience function for
+    /// reading from a file.)
+    ///
+    /// [`std::fs::read_to_string`]: crate::fs::read_to_string
+    #[cfg(feature = "alloc")]
+    fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
+        default_read_to_string(self, buf)
     }
 
     /// Determines if this `Read`er can work with buffers of uninitialized
@@ -869,8 +1036,117 @@ pub trait Seek {
     ///
     /// # Errors
     ///
+    /// Seeking can fail, for example because it might involve flushing a buffer.
+    ///
     /// Seeking to a negative offset is considered an error.
     fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
+
+    /// Rewind to the beginning of a stream.
+    ///
+    /// This is a convenience method, equivalent to `seek(SeekFrom::Start(0))`.
+    ///
+    /// # Errors
+    ///
+    /// Rewinding can fail, for example because it might involve flushing a buffer.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::io::{Read, Seek, Write};
+    /// use std::fs::OpenOptions;
+    ///
+    /// let mut f = OpenOptions::new()
+    ///     .write(true)
+    ///     .read(true)
+    ///     .create(true)
+    ///     .open("foo.txt").unwrap();
+    ///
+    /// let hello = "Hello!\n";
+    /// write!(f, "{}", hello).unwrap();
+    /// f.rewind().unwrap();
+    ///
+    /// let mut buf = String::new();
+    /// f.read_to_string(&mut buf).unwrap();
+    /// assert_eq!(&buf, hello);
+    /// ```
+    fn rewind(&mut self) -> Result<()> {
+        self.seek(SeekFrom::Start(0))?;
+        Ok(())
+    }
+
+    /// Returns the length of this stream (in bytes).
+    ///
+    /// This method is implemented using up to three seek operations. If this
+    /// method returns successfully, the seek position is unchanged (i.e. the
+    /// position before calling this method is the same as afterwards).
+    /// However, if this method returns an error, the seek position is
+    /// unspecified.
+    ///
+    /// If you need to obtain the length of *many* streams and you don't care
+    /// about the seek position afterwards, you can reduce the number of seek
+    /// operations by simply calling `seek(SeekFrom::End(0))` and using its
+    /// return value (it is also the stream length).
+    ///
+    /// Note that length of a stream can change over time (for example, when
+    /// data is appended to a file). So calling this method multiple times does
+    /// not necessarily return the same length each time.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// #![feature(seek_stream_len)]
+    /// use std::{
+    ///     io::{self, Seek},
+    ///     fs::File,
+    /// };
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let mut f = File::open("foo.txt")?;
+    ///
+    ///     let len = f.stream_len()?;
+    ///     println!("The file is currently {} bytes long", len);
+    ///     Ok(())
+    /// }
+    /// ```
+    fn stream_len(&mut self) -> Result<u64> {
+        let old_pos = self.stream_position()?;
+        let len = self.seek(SeekFrom::End(0))?;
+
+        // Avoid seeking a third time when we were already at the end of the
+        // stream. The branch is usually way cheaper than a seek operation.
+        if old_pos != len {
+            self.seek(SeekFrom::Start(old_pos))?;
+        }
+
+        Ok(len)
+    }
+
+    /// Returns the current seek position from the start of the stream.
+    ///
+    /// This is equivalent to `self.seek(SeekFrom::Current(0))`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::{
+    ///     io::{self, BufRead, BufReader, Seek},
+    ///     fs::File,
+    /// };
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let mut f = BufReader::new(File::open("foo.txt")?);
+    ///
+    ///     let before = f.stream_position()?;
+    ///     f.read_line(&mut String::new())?;
+    ///     let after = f.stream_position()?;
+    ///
+    ///     println!("The first line was {} bytes long", after - before);
+    ///     Ok(())
+    /// }
+    /// ```
+    fn stream_position(&mut self) -> Result<u64> {
+        self.seek(SeekFrom::Current(0))
+    }
 }
 
 /// Enumeration of possible methods to seek within an I/O object.
