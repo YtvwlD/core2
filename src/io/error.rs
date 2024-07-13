@@ -1,5 +1,8 @@
 use core::{convert::From, fmt, result};
 
+#[cfg(feature = "errno")]
+use strum_macros::FromRepr;
+
 /// A specialized [`Result`] type for I/O operations.
 ///
 /// This type is broadly used across [`std::io`] for any operation which may
@@ -79,6 +82,8 @@ struct Custom {
 ///
 /// [`io::Error`]: Error
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "errno", repr(i32))]
+#[cfg_attr(feature = "errno", derive(FromRepr))]
 // #[allow(deprecated)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -301,6 +306,12 @@ impl Error {
         }
     }
 
+    /// Creates a new Error from an errno.
+    #[cfg(feature = "errno")]
+    pub fn from_errno(errno: i32) -> Option<Self> {
+        ErrorKind::from_repr(-errno).map(Self::from)
+    }
+
     /// Returns a reference to the inner error wrapped by this error (if any).
     ///
     /// If this [`Error`] was constructed via [`new`] then this function will
@@ -431,6 +442,12 @@ impl Error {
             Repr::Custom(ref c) => c.kind,
             Repr::Simple(kind) => kind,
         }
+    }
+
+    /// Get the errno from an error.
+    #[cfg(feature = "errno")]
+    pub fn errno(&self) -> i32 {
+        -(self.kind() as i32)
     }
 }
 

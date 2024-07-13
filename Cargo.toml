@@ -10,12 +10,15 @@ categories = ["no-std"]
 
 [dependencies]
 memchr = { version = "2", default-features = false }
+strum = { version = "0.26", default-features = false, optional = true }
+strum_macros = { version = "0.26", optional = true }
 
 [features]
 default = ["std"]
 std = ["alloc"]
 alloc = []
 nightly = []
+errno = ["strum", "strum_macros"]
 
 [package.metadata.docs.rs]
 features = ["nightly"]
